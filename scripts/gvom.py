@@ -19,7 +19,7 @@ class Gvom:
     """
 
     def __init__(self, xy_resolution, z_resolution, xy_size, z_size, buffer_size, min_distance,positive_obstacle_threshold, 
-    negative_obstacle_threshold, slope_obsacle_threshold, robot_height, robot_radius,ground_to_lidar_height,xy_eigen_dist,z_eigen_dist):
+    negative_obstacle_threshold, slope_obstacle_threshold, robot_height, robot_radius,ground_to_lidar_height,xy_eigen_dist,z_eigen_dist):
 
         # print("init")
 
@@ -37,7 +37,7 @@ class Gvom:
 
         self.positive_obstacle_threshold = positive_obstacle_threshold
         self.negative_obstacle_threshold = negative_obstacle_threshold
-        self.slope_obsacle_threshold = slope_obsacle_threshold
+        self.slope_obstacle_threshold = slope_obstacle_threshold
         self.robot_height = robot_height
         self.robot_radius = robot_radius
         self.ground_to_lidar_height = ground_to_lidar_height
@@ -365,7 +365,7 @@ class Gvom:
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](positive_obstacle_map,0,self.xy_size,self.xy_size)
 
         self.__make_positive_obstacle_map[blockspergrid, self.threads_per_block_2D](
-            self.combined_index_map, self.height_map, self.xy_size, self.z_size, self.z_resolution, self.positive_obstacle_threshold,self.combined_hit_count,self.combined_total_count, self.robot_height, self.combined_origin,self.x_slope_map,self.y_slope_map,self.slope_obsacle_threshold, positive_obstacle_map)
+            self.combined_index_map, self.height_map, self.xy_size, self.z_size, self.z_resolution, self.positive_obstacle_threshold,self.combined_hit_count,self.combined_total_count, self.robot_height, self.combined_origin,self.x_slope_map,self.y_slope_map,self.slope_obstacle_threshold, positive_obstacle_map)
 
 
         # Check for negative obstacles. 
