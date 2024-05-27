@@ -441,6 +441,13 @@ class Gvom:
             self.guessed_height_delta, self.combined_origin, output_height_map_voxel, self.xy_size, self.xy_resolution,self.z_resolution)
 
         return output_height_map_voxel
+
+    def get_occupancy_grid(self):
+        lookup_table = self.last_combined_index_map.copy_to_host()
+        lookup_table = lookup_table.reshape((self.xy_size, self.xy_size, self.z_size))
+        lookup_table = np.swapaxes(lookup_table, 0, 2)
+        occupancy_grid = lookup_table >= 0
+        return occupancy_grid
     
     @staticmethod
     @cuda.jit
