@@ -1,5 +1,5 @@
 import numba
-from numba import vectorize, jit, cuda
+from numba import cuda
 import numpy as np
 import math
 import time
@@ -18,8 +18,9 @@ class Gvom:
 
     """
 
-    def __init__(self, xy_resolution, z_resolution, xy_size, z_size, buffer_size, min_distance,positive_obstacle_threshold, 
-    negative_obstacle_threshold, slope_obsacle_threshold, robot_height, robot_radius,ground_to_lidar_height,xy_eigen_dist,z_eigen_dist):
+    def __init__(self, xy_resolution, z_resolution, xy_size, z_size, buffer_size, min_distance, positive_obstacle_threshold, 
+                 negative_obstacle_threshold, slope_obstacle_threshold, robot_height, robot_radius, ground_to_lidar_height,
+                 xy_eigen_dist, z_eigen_dist):
 
         # print("init")
 
@@ -37,7 +38,7 @@ class Gvom:
 
         self.positive_obstacle_threshold = positive_obstacle_threshold
         self.negative_obstacle_threshold = negative_obstacle_threshold
-        self.slope_obsacle_threshold = slope_obsacle_threshold
+        self.slope_obstacle_threshold = slope_obstacle_threshold
         self.robot_height = robot_height
         self.robot_radius = robot_radius
         self.ground_to_lidar_height = ground_to_lidar_height
@@ -365,7 +366,7 @@ class Gvom:
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](positive_obstacle_map,0,self.xy_size,self.xy_size)
 
         self.__make_positive_obstacle_map[blockspergrid, self.threads_per_block_2D](
-            self.combined_index_map, self.height_map, self.xy_size, self.z_size, self.z_resolution, self.positive_obstacle_threshold,self.combined_hit_count,self.combined_total_count, self.robot_height, self.combined_origin,self.x_slope_map,self.y_slope_map,self.slope_obsacle_threshold, positive_obstacle_map)
+            self.combined_index_map, self.height_map, self.xy_size, self.z_size, self.z_resolution, self.positive_obstacle_threshold,self.combined_hit_count,self.combined_total_count, self.robot_height, self.combined_origin,self.x_slope_map,self.y_slope_map,self.slope_obstacle_threshold, positive_obstacle_map)
 
 
         # Check for negative obstacles. 
@@ -440,7 +441,15 @@ class Gvom:
             self.guessed_height_delta, self.combined_origin, output_height_map_voxel, self.xy_size, self.xy_resolution,self.z_resolution)
 
         return output_height_map_voxel
+
+    def get_occupancy_grid(self):
+        lookup_table = self.last_combined_index_map.copy_to_host()
+        lookup_table = lookup_table.reshape((self.xy_size, self.xy_size, self.z_size))
+        lookup_table = np.swapaxes(lookup_table, 0, 2)
+        occupancy_grid = lookup_table >= 0
+        return occupancy_grid
     
+    @staticmethod
     @cuda.jit
     def __make_visability_map(visability,height_map,xy_size):
         x, y = cuda.grid(2)
@@ -451,7 +460,7 @@ class Gvom:
         else:
             visability[x,y] = 0.0
 
-
+    @staticmethod
     @cuda.jit
     def __make_height_map_pointcloud(height_map,roughness,x_slope,y_slope, origin, output_voxel_map, xy_size, xy_resolution,z_resolution):
         x, y = cuda.grid(2)
@@ -467,6 +476,7 @@ class Gvom:
             output_voxel_map[index, 5] = y_slope[x,y]
             output_voxel_map[index, 6] = math.sqrt(x_slope[x,y] * x_slope[x,y] + y_slope[x,y]*y_slope[x,y])
 
+    @staticmethod
     @cuda.jit
     def __make_infered_height_map_pointcloud(height_map, origin, output_voxel_map, xy_size, xy_resolution,z_resolution):
         x, y = cuda.grid(2)
@@ -478,6 +488,7 @@ class Gvom:
             output_voxel_map[index, 1] = (y + origin[1]) * xy_resolution
             output_voxel_map[index, 2] = height_map[x, y] - z_resolution
 
+    @staticmethod
     @cuda.jit
     def __make_voxel_pointcloud(combined_index_map, combined_hit_count,combined_total_count, eigenvalues, origin, output_voxel_map, xy_size, z_size, xy_resolution, z_resolution):
         x, y, z = cuda.grid(3)
@@ -502,6 +513,7 @@ class Gvom:
             #if(d1 > 0.0) and (d2 > 0.0):
             #    output_voxel_map[index, 7] = math.log10(d1/d2)
 
+    @staticmethod
     @cuda.jit
     def __make_negative_obstacle_map(guessed_height_delta,negative_obstacle_map,negative_obstacle_threshold,xy_size):
         x, y = cuda.grid(2)
@@ -511,7 +523,7 @@ class Gvom:
         if(guessed_height_delta[x,y] > negative_obstacle_threshold):
             negative_obstacle_map[x,y] = 100
     
-
+    @staticmethod
     @cuda.jit
     def __make_positive_obstacle_map(combined_index_map, height_map, xy_size, z_size, z_resolution, positive_obstacle_threshold,hit_count,total_count, robot_height, origin,x_slope,y_slope,slope_threshold,  obstacle_map):
         """
@@ -554,9 +566,7 @@ class Gvom:
 
         obstacle_map[x, y] = int(density * 100)
 
-
-
-
+    @staticmethod
     @cuda.jit                   
     def __make_height_map(combined_origin, combined_index_map, min_height, xy_size, z_size,xy_resolution, z_resolution,ego_position,radius,ground_to_lidar_height, output_height_map):
         x, y = cuda.grid(2)
@@ -575,7 +585,7 @@ class Gvom:
                 output_height_map[x, y] = ( min_height[index] + z + combined_origin[2]) * z_resolution
                 return
 
-
+    @staticmethod
     @cuda.jit
     def __make_inferred_height_map(combined_origin, combined_index_map, xy_size, z_size, z_resolution, output_inferred_height_map):
         x, y = cuda.grid(2)
@@ -589,6 +599,7 @@ class Gvom:
                 output_inferred_height_map[x, y] = inferred_height
                 return
 
+    @staticmethod
     @cuda.jit
     def __guess_height(height_map,inferred_height_map,xy_size,xy_resolution,slope_map_x,slope_map_y,output_guessed_height_delta):
         x0, y0 = cuda.grid(2)
@@ -712,8 +723,7 @@ class Gvom:
         if(dh > 0):
             output_guessed_height_delta[x0,y0] = dh
 
-
-
+    @staticmethod
     @cuda.jit
     def __calculate_slope(height_map,xy_size,xy_resolution,output_slope_map_x,output_slope_map_y, output_roughness_map):
         x0, y0 = cuda.grid(2)
@@ -803,7 +813,8 @@ class Gvom:
         output_slope_map_y[x0,y0] = y_angle
 
         pass
-
+    
+    @staticmethod
     @cuda.jit
     def __expand_binary(input_img, output_img, xy_size, r):
         """
@@ -832,6 +843,7 @@ class Gvom:
 
         output_img[x, y] = 0
 
+    @staticmethod
     @cuda.jit
     def __lowpass_binary(input_img, output_img, xy_size, filter_size, filter_fraction):
         """
@@ -862,6 +874,7 @@ class Gvom:
         else:
             output_img[x, y] = 0
 
+    @staticmethod
     @cuda.jit
     def __convolve(input_img, output_img, kernel, xy_size, kernel_size):
         x, y = cuda.grid(2)
@@ -884,7 +897,7 @@ class Gvom:
 
         output_img[x, y] = tmp_val
 
- 
+    @staticmethod
     @cuda.jit
     def __combine_metrics(combined_metrics, combined_hit_count,combined_total_count,combined_min_height, combined_index_map, combined_origin, old_metrics, old_hit_count,old_total_count,old_min_height, old_index_map, old_origin, voxel_count, metrics_list, xy_size, z_size, num_metrics):
         x, y, z = cuda.grid(3)
@@ -979,6 +992,7 @@ class Gvom:
         combined_total_count[index] = combined_total_count[index] + old_total_count[index_old]
         combined_min_height[index] = min(combined_min_height[index],old_min_height[index_old])
 
+    @staticmethod
     @cuda.jit
     def __combine_old_metrics(combined_metrics, combined_hit_count,combined_total_count,combined_min_height, combined_index_map, combined_origin, old_metrics, old_hit_count,old_total_count,old_min_height, old_index_map, old_origin, voxel_count, metrics_list, xy_size, z_size, num_metrics):
         x, y, z = cuda.grid(3)
@@ -1005,7 +1019,7 @@ class Gvom:
         combined_total_count[index] = combined_total_count[index] + old_total_count[index_old]
         combined_min_height[index] = min(combined_min_height[index],old_min_height[index_old])
 
-
+    @staticmethod
     @cuda.jit
     def __combine_indices(combined_cell_count, combined_index_map, combined_origin, old_index_map, voxel_count, old_origin, xy_size, z_size):
         x, y, z = cuda.grid(3)
@@ -1034,6 +1048,7 @@ class Gvom:
         elif(old_index_map[index_old] < -1 and combined_index_map[index] <= -1):
             combined_index_map[index] += old_index_map[index_old] + 1
 
+    @staticmethod
     @cuda.jit
     def __combine_old_indices(combined_cell_count, combined_index_map, combined_origin, old_index_map, voxel_count, old_origin, xy_size, z_size):
         x, y, z = cuda.grid(3)
@@ -1062,6 +1077,7 @@ class Gvom:
         elif(old_index_map[index_old] < -1 and combined_index_map[index] <= -1):
             combined_index_map[index] += old_index_map[index_old] + 1
 
+    @staticmethod
     @cuda.jit
     def __combine_2_maps(map1, map2):
         pass
@@ -1118,6 +1134,7 @@ class Gvom:
 
         return metrics, min_height
 
+    @staticmethod
     @cuda.jit
     def __transform_pointcloud(points, transform, point_count):
         i = cuda.grid(1)
@@ -1137,6 +1154,7 @@ class Gvom:
             points[i, 1] = pt[1]
             points[i, 2] = pt[2]
 
+    @staticmethod
     @cuda.jit
     def __point_2_map(xy_resolution, z_resolution, xy_size, z_size, min_distance, points, hit_count, total_count, point_count, ego_position, origin):
         i = cuda.grid(1)
@@ -1230,6 +1248,7 @@ class Gvom:
 
                 length += abs(1.0/slope[slope_index])
 
+    @staticmethod
     @cuda.jit
     def __assign_indices(hit_count, miss_count, index_map, cell_count, voxel_count):
         i = cuda.grid(1)
@@ -1239,6 +1258,7 @@ class Gvom:
             else:
                 index_map[i] = - miss_count[i] - 1
 
+    @staticmethod
     @cuda.jit
     def __move_data(old, new, index_map, voxel_count):
         i = cuda.grid(1)
@@ -1246,6 +1266,7 @@ class Gvom:
             if(index_map[i] >= 0):
                 new[index_map[i]] = old[i]
 
+    @staticmethod
     @cuda.jit
     def __calculate_mean(xy_resolution, z_resolution, xy_size, z_size, min_distance, index_map, points, metrics, point_count, origin, xy_eigen_dist, z_eigen_dist):
         i = cuda.grid(1)
@@ -1297,6 +1318,7 @@ class Gvom:
 
                         cuda.atomic.add(metrics,(index,9),1.0) # update count for this voxel
 
+    @staticmethod
     @cuda.jit
     def __normalize_mean(metrics, cell_count):
         i, j = cuda.grid(2)
@@ -1307,6 +1329,7 @@ class Gvom:
 
         metrics[i,j] = metrics[i,j]/metrics[i,9]
 
+    @staticmethod
     @cuda.jit
     def __calculate_covariance(xy_resolution, z_resolution, xy_size, z_size, min_distance, index_map, points, count, metrics, point_count, origin, xy_eigen_dist, z_eigen_dist):
         i = cuda.grid(1)
@@ -1369,9 +1392,8 @@ class Gvom:
                         # zz
                         cov_zz = (local_point[2] - metrics[index,2])*(local_point[2] - metrics[index,2])
                         cuda.atomic.add(metrics,(index,8),cov_zz)
-
-                        
-            
+   
+    @staticmethod     
     @cuda.jit
     def __normalize_covariance(metrics, cell_count):
         i, j = cuda.grid(2)
@@ -1386,6 +1408,7 @@ class Gvom:
 
         metrics[i,j+3] = metrics[i,j+3]/metrics[i,9]
 
+    @staticmethod
     @cuda.jit
     def __calculate_min_height(xy_resolution, z_resolution, xy_size, z_size, min_distance, index_map, points, min_height, point_count, origin):
         i = cuda.grid(1)
@@ -1420,6 +1443,7 @@ class Gvom:
 
             cuda.atomic.min(min_height, index, local_point[2])
 
+    @staticmethod
     @cuda.jit
     def __calculate_eigenvalues(voxels_eigenvalues,metrics,cell_count):
         i = cuda.grid(1)
@@ -1487,7 +1511,7 @@ class Gvom:
             voxels_eigenvalues[i,1] = 3.0 * q - voxels_eigenvalues[i,0] - voxels_eigenvalues[i,2] 
 
 
-
+    @staticmethod
     @cuda.jit
     def __init_1D_array(array,value,length):
         i = cuda.grid(1)
@@ -1495,6 +1519,7 @@ class Gvom:
             return
         array[i] = value
     
+    @staticmethod
     @cuda.jit
     def __init_2D_array(array,value,width,height):
         x,y = cuda.grid(2)
