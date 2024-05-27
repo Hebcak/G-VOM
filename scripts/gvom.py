@@ -3,6 +3,7 @@ from numba import cuda
 import numpy as np
 import math
 import time
+from timeit import default_timer as timerboy
 import threading
 
 class Gvom:
@@ -101,13 +102,13 @@ class Gvom:
         self.ego_semaphore = threading.Semaphore()
         self.ego_position = [0,0,0]
 
-
-
     def Process_pointcloud(self, pointcloud, ego_position, transform=None):
         """ Imports a pointcloud and processes it into a voxel map then adds the map to the buffer"""
-        #pc_mem_time = time.time()
-        # Import pointcloud
-        # print("import")
+        ###### Initialization #####
+        initialization_start_event = cuda.event()
+        initialization_end_event = cuda.event()
+        initialization_start_event.record()
+        
         self.ego_semaphore.acquire()
         self.ego_position = ego_position
         self.ego_semaphore.release()
@@ -115,58 +116,54 @@ class Gvom:
         point_count = pointcloud.shape[0]
         pointcloud = cuda.to_device(pointcloud)
 
-        # Initilize arrays on GPU
-        # print("init")
+        # Initialize arrays on GPU
         cell_count = cuda.to_device(np.zeros([1], dtype=np.int32))
         # -1 = unknown, -1 < free space, >= 0 point index in shorter arrays
-        
-        
 
         index_map = cuda.device_array([self.xy_size*self.xy_size*self.z_size], dtype=np.int32)
         self.__init_1D_array[self.blocks,self.threads_per_block](index_map,-1,self.xy_size*self.xy_size*self.z_size)
-        
+
         tmp_hit_count = cuda.device_array([self.xy_size*self.xy_size*self.z_size], dtype=np.int32)
         self.__init_1D_array[self.blocks,self.threads_per_block](tmp_hit_count,0,self.xy_size*self.xy_size*self.z_size)
 
         tmp_total_count = cuda.device_array([self.xy_size*self.xy_size*self.z_size], dtype=np.int32)
         self.__init_1D_array[self.blocks,self.threads_per_block](tmp_total_count,0,self.xy_size*self.xy_size*self.z_size)
 
-        #print("     mem setup rate = " + str(1.0 / (time.time() - pc_mem_time)))
-        
-        #mem_2_time = time.time()
-
-        #ego_position = np.zeros([3])
         origin = np.zeros([3])
         origin[0] = math.floor((ego_position[0]/self.xy_resolution) - self.xy_size/2)
         origin[1] = math.floor((ego_position[1]/self.xy_resolution) - self.xy_size/2)
         origin[2] = math.floor((ego_position[2]/self.z_resolution) - self.z_size/2)
 
-        # print(origin)
         ego_position = cuda.to_device(ego_position)
         origin = cuda.to_device(origin)
 
         blocks_pointcloud = int(np.ceil(point_count/self.threads_per_block))
         blocks_map = int(np.ceil(self.xy_size*self.xy_size * self.z_size/self.threads_per_block))
 
-        #print("     mem setup 2 rate = " + str(1.0 / (time.time() - mem_2_time)))
+        initialization_end_event.record()
+        initialization_end_event.synchronize()
+        initialization_time = cuda.event_elapsed_time(initialization_start_event, initialization_end_event)
 
-        # Transform pointcloud
-        #tf_time = time.time()
-
+        ###### Transform pointcloud ######
         if not transform is None:
             self.__transform_pointcloud[blocks_pointcloud, self.threads_per_block](
                 pointcloud, transform, point_count)
-        #print("     tf rate = " + str(1.0 / (time.time() - tf_time)))
 
-        # Count points in each voxel and number of rays through each voxel
-        #count_time = time.time()
+        ###### Count points in each voxel and number of rays through each voxel ######
+        raytracing_event_start = cuda.event()
+        raytracing_event_end = cuda.event()
+        raytracing_event_start.record()
 
         self.__point_2_map[blocks_pointcloud, self.threads_per_block](
             self.xy_resolution, self.z_resolution, self.xy_size, self.z_size, self.min_distance, pointcloud, tmp_hit_count, tmp_total_count, point_count, ego_position, origin)
-        #print("     count rate = " + str(1.0 / (time.time() - count_time)))
+        raytracing_event_end.record()
+        raytracing_event_end.synchronize()
+        raytracing_time = cuda.event_elapsed_time(raytracing_event_start, raytracing_event_end)
 
-        # Make index map so we only need to store data on non-empty voxels
-        #small_time = time.time()
+        ###### Make index map so we only need to store data on non-empty voxels ######
+        memory_smallification_event_start = cuda.event()
+        memory_smallification_event_end = cuda.event()
+        memory_smallification_event_start.record()
 
         self.__assign_indices[blocks_map, self.threads_per_block](tmp_hit_count,tmp_total_count, index_map, cell_count, self.voxel_count)
 
@@ -174,51 +171,49 @@ class Gvom:
         hit_count = cuda.device_array([cell_count_cpu], dtype=np.int32)
         total_count = cuda.device_array([cell_count_cpu], dtype=np.int32)
 
-        # Move count to smaller array
         self.__move_data[blocks_map, self.threads_per_block](
             tmp_hit_count, hit_count, index_map, self.voxel_count)
 
         self.__move_data[blocks_map, self.threads_per_block](
             tmp_total_count, total_count, index_map, self.voxel_count)
 
-        #print("     move to small time = " + str(1.0 / (time.time() - small_time)))
+        memory_smallification_event_end.record()
+        memory_smallification_event_end.synchronize()
+        smallification_time = cuda.event_elapsed_time(memory_smallification_event_start, memory_smallification_event_end)
 
-
-        # Calculate metrics
-        #met_time = time.time()
+        ###### Calculate metrics ######
+        metrics_event_start = cuda.event()
+        metrics_event_end = cuda.event()
+        metrics_event_start.record()
 
         metrics, min_height = self.__calculate_metrics_master(pointcloud, point_count, hit_count, index_map, cell_count_cpu, origin)
-        #print("     metrics rate = " + str(1.0 / (time.time() - met_time)))
-        
 
+        metrics_event_end.record()
+        metrics_event_end.synchronize()
+        metrics_time = cuda.event_elapsed_time(metrics_event_start, metrics_event_end)
 
-        # Assign data to buffer
-        #buf_time = time.time()
+        ###### Assign data to buffer ######
+        buffer_start = time.time()
 
         # Block the main thread from accessing this buffer index wile we write to it
         self.semaphores[self.buffer_index].acquire()
-
         self.index_buffer[self.buffer_index] = index_map
         self.hit_count_buffer[self.buffer_index] = hit_count
         self.total_count_buffer[self.buffer_index] = total_count
         self.metrics_buffer[self.buffer_index] = metrics
         self.min_height_buffer[self.buffer_index] = min_height
-        self.origin_buffer[self.buffer_index] = origin      
-        
+        self.origin_buffer[self.buffer_index] = origin
         #release this buffer index
         self.semaphores[self.buffer_index].release()
-        #print("wrote to buffer index: " + str(self.buffer_index))
         
         self.last_buffer_index = self.buffer_index
-
         self.buffer_index += 1
-
         if(self.buffer_index >= self.buffer_size):
             self.buffer_index = 0
-        #print("     buf rate = " + str(1.0 / (time.time() - buf_time)))
 
-        # return pointcloud.copy_to_host()
-        # return index_map.copy_to_host()
+        buffer_time = (time.time() - buffer_start)*1000
+
+        return initialization_time, raytracing_time, smallification_time, metrics_time, buffer_time
 
     def combine_maps(self):
         """ Combines all maps in the buffer and processes into 2D maps """
