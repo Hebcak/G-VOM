@@ -3,7 +3,6 @@ from numba import cuda
 import numpy as np
 import math
 import time
-from timeit import default_timer as timerboy
 import threading
 
 class Gvom:
@@ -102,13 +101,13 @@ class Gvom:
         self.ego_semaphore = threading.Semaphore()
         self.ego_position = [0,0,0]
 
-    def Process_pointcloud(self, pointcloud, ego_position, transform=None):
+    def process_pointcloud(self, pointcloud, ego_position, transform=None):
         """ Imports a pointcloud and processes it into a voxel map then adds the map to the buffer"""
         ###### Initialization #####
         initialization_start_event = cuda.event()
         initialization_end_event = cuda.event()
         initialization_start_event.record()
-        
+
         self.ego_semaphore.acquire()
         self.ego_position = ego_position
         self.ego_semaphore.release()
@@ -160,12 +159,21 @@ class Gvom:
         raytracing_event_end.synchronize()
         raytracing_time = cuda.event_elapsed_time(raytracing_event_start, raytracing_event_end)
 
+        ###### Populate the lookup table with the correct indexes ######
+        index_calculation_event_start = cuda.event()
+        index_calculation_event_end = cuda.event()
+        index_calculation_event_start.record()
+
+        self.__assign_indices[blocks_map, self.threads_per_block](tmp_hit_count,tmp_total_count, index_map, cell_count, self.voxel_count)
+
+        index_calculation_event_end.record()
+        index_calculation_event_end.synchronize()
+        index_calculation_time = cuda.event_elapsed_time(index_calculation_event_start, index_calculation_event_end)
+
         ###### Make index map so we only need to store data on non-empty voxels ######
         memory_smallification_event_start = cuda.event()
         memory_smallification_event_end = cuda.event()
         memory_smallification_event_start.record()
-
-        self.__assign_indices[blocks_map, self.threads_per_block](tmp_hit_count,tmp_total_count, index_map, cell_count, self.voxel_count)
 
         cell_count_cpu = cell_count.copy_to_host()[0]
         hit_count = cuda.device_array([cell_count_cpu], dtype=np.int32)
@@ -213,7 +221,7 @@ class Gvom:
 
         buffer_time = (time.time() - buffer_start)*1000
 
-        return initialization_time, raytracing_time, smallification_time, metrics_time, buffer_time
+        return initialization_time, raytracing_time, index_calculation_time,  smallification_time, metrics_time, buffer_time
 
     def combine_maps(self):
         """ Combines all maps in the buffer and processes into 2D maps """
