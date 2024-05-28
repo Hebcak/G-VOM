@@ -201,7 +201,9 @@ class Gvom:
         metrics_time = cuda.event_elapsed_time(metrics_event_start, metrics_event_end)
 
         ###### Assign data to buffer ######
-        buffer_start = time.time()
+        buffer_event_start = cuda.event()
+        buffer_event_end = cuda.event()
+        buffer_event_start.record()
 
         # Block the main thread from accessing this buffer index wile we write to it
         self.semaphores[self.buffer_index].acquire()
@@ -219,7 +221,9 @@ class Gvom:
         if(self.buffer_index >= self.buffer_size):
             self.buffer_index = 0
 
-        buffer_time = (time.time() - buffer_start)*1000
+        buffer_event_end.record()
+        buffer_event_end.synchronize()
+        buffer_time = cuda.event_elapsed_time(buffer_event_start, buffer_event_end)
 
         return initialization_time, raytracing_time, index_calculation_time,  smallification_time, metrics_time, buffer_time
 
