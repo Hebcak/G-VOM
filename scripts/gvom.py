@@ -225,17 +225,22 @@ class Gvom:
 
     def combine_maps(self):
         """ Combines all maps in the buffer and processes into 2D maps """
-        total_execution_time = 0.0
-        ###### initialization of combined lookup table ######
-        ind_init_start_event = cuda.event()
-        ind_init_end_event = cuda.event()
-        ind_init_start_event.record()
-
         if(self.origin_buffer[self.last_buffer_index] is None):
             print("ERROR: No data in buffer")
             return
+        
+        total_execution_time = 0.0
+        
+        ###### Combine the lookup tables, calculate total number of occupied voxels ######
+        comb_lookup_start_event = cuda.event()
+        comb_lookup_end_event = cuda.event()
+        comb_lookup_start_event.record()
 
         self.combined_origin = cuda.to_device(self.origin_buffer[self.last_buffer_index].copy_to_host())
+        combined_origin_world = self.combined_origin.copy_to_host()
+        combined_origin_world[0] = combined_origin_world[0] * self.xy_resolution
+        combined_origin_world[1] = combined_origin_world[1] * self.xy_resolution
+        combined_origin_world[2] = combined_origin_world[2] * self.z_resolution
 
         combined_cell_count = np.zeros([1], dtype=np.int64)
         self.combined_index_map = cuda.device_array([self.xy_size*self.xy_size*self.z_size], dtype=np.int32)
@@ -244,16 +249,6 @@ class Gvom:
         blockspergrid_xy = math.ceil(self.xy_size / self.threads_per_block_3D[0])
         blockspergrid_z = math.ceil(self.z_size / self.threads_per_block_3D[2])
         blockspergrid = (blockspergrid_xy, blockspergrid_xy, blockspergrid_z)
-
-        ind_init_end_event.record()
-        ind_init_end_event.synchronize()
-        ind_init_time = cuda.event_elapsed_time(ind_init_start_event, ind_init_end_event)
-        total_execution_time += ind_init_time
-
-        ###### Combine the lookup tables, calculate total number of occupied voxels ######
-        comb_lookup_start_event = cuda.event()
-        comb_lookup_end_event = cuda.event()
-        comb_lookup_start_event.record()
 
         for i in range(0, self.buffer_size):
             # Combine maps currently in the buffer
@@ -277,10 +272,10 @@ class Gvom:
         comb_lookup_time = cuda.event_elapsed_time(comb_lookup_start_event, comb_lookup_end_event)
         total_execution_time += comb_lookup_time
 
-        ###### Initialize the combined data buffers ######
-        data_init_start_event = cuda.event()
-        data_init_end_event = cuda.event()
-        data_init_start_event.record()
+        ###### Combine the data ######
+        comb_data_start_event = cuda.event()
+        comb_data_end_event = cuda.event()
+        comb_data_start_event.record()
 
         blockspergrid_cell = math.ceil(self.combined_cell_count_cpu/self.threads_per_block)
         self.combined_hit_count = cuda.device_array([self.combined_cell_count_cpu], dtype=np.int32)
@@ -299,16 +294,6 @@ class Gvom:
         self.combined_metrics = cuda.device_array([self.combined_cell_count_cpu,self.metrics_count], dtype=np.float32)
         self.__init_2D_array[blockspergrid_2D,self.threads_per_block_2D](self.combined_metrics,0,self.combined_cell_count_cpu, self.metrics_count)
 
-        data_init_end_event.record()
-        data_init_end_event.synchronize()
-        data_init_time = cuda.event_elapsed_time(data_init_start_event, data_init_end_event)
-        total_execution_time += data_init_time
-
-        ###### Combine the data ######
-        comb_data_start_event = cuda.event()
-        comb_data_end_event = cuda.event()
-        comb_data_start_event.record()
-
         for i in range(0, self.buffer_size):
             # Combine maps currently in the buffer
             self.semaphores[i].acquire()
@@ -324,16 +309,6 @@ class Gvom:
             self.__combine_metrics[blockspergrid, self.threads_per_block_3D](self.combined_metrics, self.combined_hit_count,self.combined_total_count,self.combined_min_height, self.combined_index_map, self.combined_origin, self.last_combined_metrics,
                                                                                   self.last_combined_hit_count,self.last_combined_total_count,self.last_combined_min_height, self.last_combined_index_map, self.last_combined_origin, self.voxel_count, self.metrics, self.xy_size, self.z_size, len(self.metrics))
 
-        comb_data_end_event.record()
-        comb_data_end_event.synchronize()
-        comb_data_time = cuda.event_elapsed_time(comb_data_start_event, comb_data_end_event)
-        total_execution_time += comb_data_time
-
-        ###### Buffer the new map ######
-        buffer_start_event = cuda.event()
-        buffer_end_event = cuda.event()
-        buffer_start_event.record()
-
         self.last_combined_cell_count_cpu = self.combined_cell_count_cpu
         self.last_combined_hit_count = self.combined_hit_count
         self.last_combined_total_count = self.combined_total_count
@@ -342,10 +317,10 @@ class Gvom:
         self.last_combined_min_height = self.combined_min_height
         self.last_combined_origin = self.combined_origin
 
-        buffer_end_event.record()
-        buffer_end_event.synchronize()
-        buffer_time = cuda.event_elapsed_time(buffer_start_event, buffer_end_event)
-        total_execution_time += buffer_time
+        comb_data_end_event.record()
+        comb_data_end_event.synchronize()
+        comb_data_time = cuda.event_elapsed_time(comb_data_start_event, comb_data_end_event)
+        total_execution_time += comb_data_time
 
         ###### Calculate eigenvalues for each voxel ######
         eigen_start_event = cuda.event()
@@ -470,26 +445,11 @@ class Gvom:
         visibility_time = cuda.event_elapsed_time(visibility_start_event, visibility_end_event)
         total_execution_time += visibility_time
 
-        ###### Calculate combined map origin ######
-        origin_start_event = cuda.event()
-        origin_end_event = cuda.event()
-        origin_start_event.record()
-
-        combined_origin_world = self.combined_origin.copy_to_host()
-        combined_origin_world[0] = combined_origin_world[0] * self.xy_resolution
-        combined_origin_world[1] = combined_origin_world[1] * self.xy_resolution
-        combined_origin_world[2] = combined_origin_world[2] * self.z_resolution
-
-        origin_end_event.record()
-        origin_end_event.synchronize()
-        origin_time = cuda.event_elapsed_time(origin_start_event, origin_end_event)
-        total_execution_time += origin_time
-
         ###### Assemble return values #####
         map_return_tuple = (combined_origin_world, positive_obstacle_map.copy_to_host(),negative_obstacle_map.copy_to_host(),
                             self.roughness_map.copy_to_host(),visibility_map.copy_to_host())
-        times_return_tuple = (ind_init_time, comb_lookup_time, data_init_time, comb_data_time, buffer_time, eigen_time, height_map_time,
-                              slope_time, guess_time, positive_time, negative_time, visibility_time, origin_time, total_execution_time)
+        times_return_tuple = (comb_lookup_time, comb_data_time, eigen_time, height_map_time,
+                              slope_time, guess_time, positive_time, negative_time, visibility_time, total_execution_time)
         return map_return_tuple, times_return_tuple
 
     def make_debug_voxel_map(self):
@@ -1020,27 +980,21 @@ class Gvom:
 
         if(index < 0 or index_old < 0):
             return
-
-       
-
         
-        ## Combine covariance
-        
-        #self.metrics_count = 10 # Mean: x, y, z; Covariance: xx, xy, xz, yy, yz, zz; Count
-        #                               0  1  2               3   4   5   6   7   8
-
-        
-        # C = (n1 * C1 + n2 * C2 + 
-        #   n1 * (mean_x1 - mean_x_combined) * (mean_y1 - mean_y_combined) + 
-        #   n2 * (mean_x2 - mean_x_combined) * (mean_y2 - mean_y_combined)
-        #   ) / (n1 + n2)
-
+        ## Combine mean
         mean_x_combined = (combined_metrics[index,0] * combined_metrics[index,9] + old_metrics[index_old, 0] * old_metrics[index_old, 9]) / (combined_metrics[index,9] + old_metrics[index_old, 9])
 
         mean_y_combined = (combined_metrics[index,1] * combined_metrics[index,9] + old_metrics[index_old, 1] * old_metrics[index_old, 9]) / (combined_metrics[index,9] + old_metrics[index_old, 9])
 
         mean_z_combined = (combined_metrics[index,2] * combined_metrics[index,9] + old_metrics[index_old, 2] * old_metrics[index_old, 9]) / (combined_metrics[index,9] + old_metrics[index_old, 9])
+        #x
+        combined_metrics[index,0] = mean_x_combined
+        #y
+        combined_metrics[index,1] = mean_y_combined
+        #z
+        combined_metrics[index,2] = mean_z_combined
 
+        # Combine covariance
         # xx
         combined_metrics[index,3] =( combined_metrics[index,9] * combined_metrics[index,3] + old_metrics[index_old, 9] * old_metrics[index_old, 3] + 
             combined_metrics[index,9] * (combined_metrics[index,0] - mean_x_combined) * (combined_metrics[index,0] - mean_x_combined) + 
@@ -1075,15 +1029,6 @@ class Gvom:
             combined_metrics[index,9] * (combined_metrics[index,2] - mean_z_combined) * (combined_metrics[index,2] - mean_z_combined) + 
             old_metrics[index_old, 9] *  (old_metrics[index_old,2] - mean_z_combined) *  (old_metrics[index_old,2] - mean_z_combined)
             ) / (combined_metrics[index,9] + old_metrics[index_old, 9]) 
-
-        ## Combine mean
-
-        #x
-        combined_metrics[index,0] = mean_x_combined
-        #y
-        combined_metrics[index,1] = mean_y_combined
-        #z
-        combined_metrics[index,2] = mean_z_combined
 
         ## Combine other metrics
         combined_metrics[index,9] = combined_metrics[index,9] + old_metrics[index_old, 9]
@@ -1550,13 +1495,6 @@ class Gvom:
         if(i >= cell_count):
             return
 
-        # Mean: x, y, z; Covariance: xx, xy, xz, yy, yz, zz
-        #       0  1  2               3   4   5   6   7   8
-
-        # [xx   xy   xz]
-        # [xy   yy   yz]
-        # [xz   yz   zz]
-
         xx = metrics[i,3]
         xy = metrics[i,4]
         xz = metrics[i,5]
@@ -1570,20 +1508,12 @@ class Gvom:
         q = (xx + yy + zz ) / 3.0
         
         if (p1 == 0): # diagonal matrix
-
             voxels_eigenvalues[i,0] = max(xx,max(yy,zz))
-            
             voxels_eigenvalues[i,2] = min(xx,min(yy,zz))
-
             voxels_eigenvalues[i,1] = 3.0 * q - voxels_eigenvalues[i,0] - voxels_eigenvalues[i,2]
-
-
         else:
-
-            
             p2 = (xx - q)*(xx - q) + (yy - q)*(yy - q) + (zz - q)*(zz - q) + 2.0 * p1
             p = math.sqrt(p2 / 6.0)
-            
             B = numba.cuda.local.array(shape=6, dtype=numba.float64)
 
             B[0] = (xx - q)/p
