@@ -958,26 +958,21 @@ class Gvom:
 
     @staticmethod
     @cuda.jit
-    def __combine_metrics(combined_metrics, combined_hit_count,combined_total_count,combined_min_height, combined_index_map, combined_origin, old_metrics, old_hit_count,old_total_count,old_min_height, old_index_map, old_origin, voxel_count, metrics_list, xy_size, z_size, num_metrics):
+    def __combine_metrics(combined_metrics, combined_hit_count,combined_total_count,combined_min_height, combined_index_map,
+                          combined_origin, old_metrics, old_hit_count,old_total_count,old_min_height, old_index_map, old_origin, voxel_count, metrics_list, xy_size, z_size, num_metrics):
         x, y, z = cuda.grid(3)
-
         if(x >= xy_size or y >= xy_size or z >= z_size): # Check kernel bounds
             return
 
         # Calculate offset between old and new maps
-
         dx = combined_origin[0] - old_origin[0]
         dy = combined_origin[1] - old_origin[1]
         dz = combined_origin[2] - old_origin[2]
-
         if((x + dx) >= xy_size or (y + dy) >= xy_size or (z + dz) >= z_size or (x+dx) < 0 or (y+dy) < 0 or (z+dz) < 0):
             return
 
-        index = combined_index_map[int(
-            x + y * xy_size + z * xy_size * xy_size)]
-        index_old = old_index_map[int(
-            (x + dx) + (y + dy) * xy_size + (z + dz) * xy_size * xy_size)]
-
+        index = combined_index_map[int(x + y * xy_size + z * xy_size * xy_size)]
+        index_old = old_index_map[int((x + dx) + (y + dy) * xy_size + (z + dz) * xy_size * xy_size)]
         if(index < 0 or index_old < 0):
             return
         
@@ -1065,30 +1060,26 @@ class Gvom:
 
     @staticmethod
     @cuda.jit
-    def __combine_indices(combined_cell_count, combined_index_map, combined_origin, old_index_map, voxel_count, old_origin, xy_size, z_size):
+    def __combine_indices(combined_cell_count, combined_index_map, combined_origin, old_index_map, voxel_count, old_origin, xy_size,
+                          z_size):
         x, y, z = cuda.grid(3)
-
         if(x >= xy_size or y >= xy_size or z >= z_size):
-            #print("bad index")
             return
 
         dx = combined_origin[0] - old_origin[0]
         dy = combined_origin[1] - old_origin[1]
         dz = combined_origin[2] - old_origin[2]
-
         if((x + dx) >= xy_size or (y + dy) >= xy_size or (z + dz) >= z_size or (x+dx) < 0 or (y+dy) < 0 or (z+dz) < 0):
-            # print("oob")
             return
 
         index = int(x + y * xy_size + z * xy_size * xy_size)
         index_old = int((x + dx) + (y + dy) * xy_size +
                         (z + dz) * xy_size * xy_size)
 
-        # If there is no data or empty data in the combined map and an occpuied voexl in the new map
+        # If there is no data or empty data in the combined map and an occupied voxel in the new map
         if(old_index_map[index_old] >= 0 and combined_index_map[index] <= -1):
             combined_index_map[index] = cuda.atomic.add(combined_cell_count, 0, 1)
-
-        # if there is an empty cell in the old map and no data or empty data in the new map
+        # If there is an empty cell in the old map and no data or empty data in the new map
         elif(old_index_map[index_old] < -1 and combined_index_map[index] <= -1):
             combined_index_map[index] += old_index_map[index_old] + 1
 
@@ -1127,9 +1118,6 @@ class Gvom:
         pass
 
     def __calculate_metrics_master(self, pointcloud, point_count, count, index_map, cell_count_cpu, origin):
-        # print("mean")
-        #self.metrics_count = 10 # Mean: x, y, z; Covariance: xx, xy, xz, yy, yz, zz; Count
-
         metric_blocks = self.blocks = math.ceil(self.xy_size*self.xy_size*self.z_size / self.threads_per_block)
 
         blockspergrid_cell = math.ceil(cell_count_cpu / self.threads_per_block_2D[0])
@@ -1139,42 +1127,24 @@ class Gvom:
         metrics = cuda.device_array([cell_count_cpu,self.metrics_count])
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](metrics,0.0,cell_count_cpu,self.metrics_count)
 
-
-        #print("min height")
         min_height = cuda.device_array([cell_count_cpu*3], dtype=np.float32)
         self.__init_1D_array[math.ceil(cell_count_cpu*3/self.threads_per_block),self.threads_per_block](min_height,1,cell_count_cpu*3)
 
-
-        #print("calc blocks")
-        calculate_blocks = ( int(np.ceil(point_count/self.threads_per_block)))
+        calculate_blocks = (int(np.ceil(point_count/self.threads_per_block)))
         
-        #print("calc mean")
-        
-        self.__calculate_mean[calculate_blocks, self.threads_per_block](
-            self.xy_resolution, self.z_resolution, self.xy_size, self.z_size, self.min_distance, index_map, pointcloud, metrics, point_count, origin, self.xy_eigen_dist, self.z_eigen_dist)
-        
-        #print("norm")
-        normalize_blocks = ( int(np.ceil(cell_count_cpu/self.threads_per_block_2D[0])), int(np.ceil(3/self.threads_per_block_2D[0])) )
-
+        self.__calculate_mean[calculate_blocks, self.threads_per_block](self.xy_resolution, self.z_resolution, self.xy_size,
+                                                                        self.z_size, self.min_distance, index_map, pointcloud, metrics, point_count, origin, self.xy_eigen_dist, self.z_eigen_dist)
+        normalize_blocks = (int(np.ceil(cell_count_cpu/self.threads_per_block_2D[0])), int(np.ceil(3/self.threads_per_block_2D[0])) )
         self.__normalize_mean[normalize_blocks,self.threads_per_block_2D](metrics,cell_count_cpu)
-        #print("other")
         
-        
-        self.__calculate_covariance[calculate_blocks,self.threads_per_block](
-
-            self.xy_resolution, self.z_resolution, self.xy_size, self.z_size, self.min_distance, index_map, pointcloud, count, metrics, point_count, origin, self.xy_eigen_dist, self.z_eigen_dist
-            
-                )
-        
-        normalize_blocks = ( int(np.ceil(cell_count_cpu/self.threads_per_block_2D[0])), int(np.ceil(6/self.threads_per_block_2D[0])) )
-
-
+        self.__calculate_covariance[calculate_blocks,self.threads_per_block](self.xy_resolution, self.z_resolution, self.xy_size,
+                                                                             self.z_size, self.min_distance, index_map, pointcloud, count, metrics, point_count, origin, self.xy_eigen_dist, self.z_eigen_dist)
+    
+        normalize_blocks = (int(np.ceil(cell_count_cpu/self.threads_per_block_2D[0])), int(np.ceil(6/self.threads_per_block_2D[0])))
         self.__normalize_covariance[normalize_blocks,self.threads_per_block_2D](metrics,cell_count_cpu)
 
         self.__calculate_min_height[calculate_blocks, self.threads_per_block](
             self.xy_resolution, self.z_resolution, self.xy_size, self.z_size, self.min_distance, index_map, pointcloud, min_height, point_count, origin)
-        
-        #print("return")
 
         return metrics, min_height
 
@@ -1257,9 +1227,7 @@ class Gvom:
             slope[2] = slope[2] / ray_length
 
             slope_max = max(abs(slope[0]), max(abs(slope[1]), abs(slope[2])))
-
             slope_index = 0
-
             if(slope_max == abs(slope[1])):
                 slope_index = 1
             if(slope_max == abs(slope[2])):
@@ -1269,10 +1237,8 @@ class Gvom:
             direction = slope[slope_index]/abs(slope[slope_index])
             while (length < ray_length - 1):
                 pt[slope_index] += direction
-                pt[(slope_index + 1) % 3] += slope[(slope_index + 1) %
-                                                   3] / abs(slope[slope_index])
-                pt[(slope_index + 2) % 3] += slope[(slope_index + 2) %
-                                                   3] / abs(slope[slope_index])
+                pt[(slope_index + 1) % 3] += slope[(slope_index + 1) % 3] / abs(slope[slope_index])
+                pt[(slope_index + 2) % 3] += slope[(slope_index + 2) % 3] / abs(slope[slope_index])
 
                 x_index = math.floor(pt[0] - origin[0])
                 if(x_index < 0 or x_index >= xy_size):
@@ -1329,32 +1295,24 @@ class Gvom:
             z_index_base = math.floor((points[i, 2]/z_resolution) - origin[2])
 
             for x_index in range(x_index_base - xy_eigen_dist,  x_index_base + 1 + xy_eigen_dist):
-
                 if(x_index < 0 or x_index >= xy_size):
                     continue
 
                 for y_index in range(y_index_base - xy_eigen_dist, y_index_base + 1 + xy_eigen_dist ):
-
                     if(y_index < 0 or y_index >= xy_size):
                         continue
 
                     for z_index in range(z_index_base - z_eigen_dist, z_index_base + 1 + z_eigen_dist):
-
                         if(z_index < 0 or z_index >= z_size):
                             continue
-
-                        
 
                         local_point[0] = (points[i, 0]/xy_resolution) - origin[0] - x_index
                         local_point[1] = (points[i, 1]/xy_resolution) - origin[1] - y_index
                         local_point[2] = (points[i, 2]/z_resolution) - origin[2] - z_index
 
-
                         index = index_map[int( x_index + y_index*xy_size + z_index*xy_size*xy_size )]
-
-                        if index <0 :
-                                continue
-
+                        if index < 0:
+                            continue
 
                         cuda.atomic.add(metrics, (index,0), local_point[0])
                         cuda.atomic.add(metrics, (index,1), local_point[1])
@@ -1381,7 +1339,6 @@ class Gvom:
 
             d2 = points[i, 0]*points[i, 0] + points[i, 1] * \
                 points[i, 1] + points[i, 2]*points[i, 2]
-
             if(d2 < min_distance*min_distance):
                 return
 
@@ -1392,31 +1349,24 @@ class Gvom:
             z_index_base = math.floor((points[i, 2]/z_resolution) - origin[2])
 
             for x_index in range(x_index_base - xy_eigen_dist,  x_index_base + 1 + xy_eigen_dist):
-
                 if(x_index < 0 or x_index >= xy_size):
                     continue
 
                 for y_index in range(y_index_base - xy_eigen_dist, y_index_base + 1 + xy_eigen_dist ):
-
                     if(y_index < 0 or y_index >= xy_size):
                         continue
 
                     for z_index in range(z_index_base - z_eigen_dist, z_index_base + 1 + z_eigen_dist):
-
                         if(z_index < 0 or z_index >= z_size):
                             continue
-
-                        
 
                         local_point[0] = (points[i, 0]/xy_resolution) - origin[0] - x_index
                         local_point[1] = (points[i, 1]/xy_resolution) - origin[1] - y_index
                         local_point[2] = (points[i, 2]/z_resolution) - origin[2] - z_index
 
-
                         index = index_map[int( x_index + y_index*xy_size + z_index*xy_size*xy_size )]
-
                         if index <0 :
-                                continue
+                            continue
 
                         # xx
                         cov_xx = (local_point[0] - metrics[index,0])*(local_point[0] - metrics[index,0])
