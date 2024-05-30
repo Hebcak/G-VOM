@@ -229,43 +229,57 @@ class Gvom:
 
     def combine_maps(self):
         """ Combines all maps in the buffer and processes into 2D maps """
-        #voxel_start_time = time.time()
         if(self.origin_buffer[self.last_buffer_index] is None):
             print("ERROR: No data in buffer")
             return
+        
+        total_execution_time = 0.0
+        
+        ###### Combine the lookup tables, calculate total number of occupied voxels ######
+        comb_lookup_start_event = cuda.event()
+        comb_lookup_end_event = cuda.event()
+        comb_lookup_start_event.record()
 
         self.combined_origin = cuda.to_device(self.origin_buffer[self.last_buffer_index].copy_to_host())
+        combined_origin_world = self.combined_origin.copy_to_host()
+        combined_origin_world[0] = combined_origin_world[0] * self.xy_resolution
+        combined_origin_world[1] = combined_origin_world[1] * self.xy_resolution
+        combined_origin_world[2] = combined_origin_world[2] * self.z_resolution
 
         combined_cell_count = np.zeros([1], dtype=np.int64)
         self.combined_index_map = cuda.device_array([self.xy_size*self.xy_size*self.z_size], dtype=np.int32)
         self.__init_1D_array[self.blocks,self.threads_per_block](self.combined_index_map,-1,self.xy_size*self.xy_size*self.z_size)
 
-
         blockspergrid_xy = math.ceil(self.xy_size / self.threads_per_block_3D[0])
         blockspergrid_z = math.ceil(self.z_size / self.threads_per_block_3D[2])
         blockspergrid = (blockspergrid_xy, blockspergrid_xy, blockspergrid_z)
 
-        # Combines the index maps and calculates the nessisary size for the combined map
-
         for i in range(0, self.buffer_size):
+            # Combine maps currently in the buffer
             self.semaphores[i].acquire()
             if(self.origin_buffer[i] is None):
                 self.semaphores[i].release()
                 continue
-
-            
             self.__combine_indices[blockspergrid, self.threads_per_block_3D](
                 combined_cell_count, self.combined_index_map, self.combined_origin, self.index_buffer[i], self.voxel_count, self.origin_buffer[i], self.xy_size, self.z_size)
             self.semaphores[i].release()
 
         if not (self.last_combined_origin is None):
-             #print("combine_old_indices")
-             #__combine_old_indices
+            # If previous merged map exists, combine it too
             self.__combine_old_indices[blockspergrid, self.threads_per_block_3D](
                  combined_cell_count, self.combined_index_map, self.combined_origin, self.last_combined_index_map, self.voxel_count, self.last_combined_origin, self.xy_size, self.z_size)
 
         self.combined_cell_count_cpu = combined_cell_count[0]
-        # print(self.combined_cell_count_cpu)
+
+        comb_lookup_end_event.record()
+        comb_lookup_end_event.synchronize()
+        comb_lookup_time = cuda.event_elapsed_time(comb_lookup_start_event, comb_lookup_end_event)
+        total_execution_time += comb_lookup_time
+
+        ###### Combine the data ######
+        comb_data_start_event = cuda.event()
+        comb_data_end_event = cuda.event()
+        comb_data_start_event.record()
 
         blockspergrid_cell = math.ceil(self.combined_cell_count_cpu/self.threads_per_block)
         self.combined_hit_count = cuda.device_array([self.combined_cell_count_cpu], dtype=np.int32)
@@ -284,28 +298,20 @@ class Gvom:
         self.combined_metrics = cuda.device_array([self.combined_cell_count_cpu,self.metrics_count], dtype=np.float32)
         self.__init_2D_array[blockspergrid_2D,self.threads_per_block_2D](self.combined_metrics,0,self.combined_cell_count_cpu, self.metrics_count)
 
-        # Combines the data in the buffer
         for i in range(0, self.buffer_size):
-            
+            # Combine maps currently in the buffer
             self.semaphores[i].acquire()
-
             if(self.origin_buffer[i] is None):
                 self.semaphores[i].release()
                 continue
-            
-            
             self.__combine_metrics[blockspergrid, self.threads_per_block_3D](self.combined_metrics, self.combined_hit_count,self.combined_total_count,self.combined_min_height, self.combined_index_map, self.combined_origin, self.metrics_buffer[
                                                                              i], self.hit_count_buffer[i],self.total_count_buffer[i], self.min_height_buffer[i],self.index_buffer[i], self.origin_buffer[i], self.voxel_count, self.metrics, self.xy_size, self.z_size, len(self.metrics))
-            
             self.semaphores[i].release()
 
-        # fill unknown cells with data from the last combined map
         if not (self.last_combined_origin is None):
-                #__combine_old_metrics
+            # If previous merged map exists, combine it too
             self.__combine_metrics[blockspergrid, self.threads_per_block_3D](self.combined_metrics, self.combined_hit_count,self.combined_total_count,self.combined_min_height, self.combined_index_map, self.combined_origin, self.last_combined_metrics,
                                                                                   self.last_combined_hit_count,self.last_combined_total_count,self.last_combined_min_height, self.last_combined_index_map, self.last_combined_origin, self.voxel_count, self.metrics, self.xy_size, self.z_size, len(self.metrics))
-
-        # set the last combined map
 
         self.last_combined_cell_count_cpu = self.combined_cell_count_cpu
         self.last_combined_hit_count = self.combined_hit_count
@@ -315,23 +321,35 @@ class Gvom:
         self.last_combined_min_height = self.combined_min_height
         self.last_combined_origin = self.combined_origin
 
-        # Compute eigenvalues for each voxel
+        comb_data_end_event.record()
+        comb_data_end_event.synchronize()
+        comb_data_time = cuda.event_elapsed_time(comb_data_start_event, comb_data_end_event)
+        total_execution_time += comb_data_time
+
+        ###### Calculate eigenvalues for each voxel ######
+        eigen_start_event = cuda.event()
+        eigen_end_event = cuda.event()
+        eigen_start_event.record()
+
         blockspergrid_cell_2D = math.ceil(self.combined_cell_count_cpu / self.threads_per_block_2D[0])
         blockspergrid_eigenvalue_2D = math.ceil(3 / self.threads_per_block_2D[1])
         blockspergrid_2D = (blockspergrid_cell_2D, blockspergrid_eigenvalue_2D)
 
         self.voxels_eigenvalues = cuda.device_array([self.combined_cell_count_cpu,3], dtype=np.float32)
         self.__init_2D_array[blockspergrid_2D,self.threads_per_block_2D](self.voxels_eigenvalues,0,self.combined_cell_count_cpu, 3)
-
         self.__calculate_eigenvalues[blockspergrid_cell,self.threads_per_block](self.voxels_eigenvalues,self.combined_metrics,self.combined_cell_count_cpu)
 
-
-        #print("voxel map rate = " + str(1.0 / (time.time() - voxel_start_time)))
-        #map_start_time = time.time()
+        eigen_end_event.record()
+        eigen_end_event.synchronize()
+        eigen_time = cuda.event_elapsed_time(eigen_start_event, eigen_end_event)
+        total_execution_time += eigen_time
 
         # Make 2d maps from combined map
+        ###### Create a height map ######
+        height_map_start_event = cuda.event()
+        height_map_end_event = cuda.event()
+        height_map_start_event.record()
 
-        # Make height map from minimum height in lowest cell
         self.height_map = cuda.device_array([self.xy_size,self.xy_size])
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](self.height_map,-1000.0,self.xy_size,self.xy_size)
         
@@ -345,7 +363,16 @@ class Gvom:
 
         self.__make_inferred_height_map[blockspergrid, self.threads_per_block_2D](
             self.combined_origin, self.combined_index_map, self.xy_size, self.z_size, self.z_resolution, self.inferred_height_map)
-        # Estimate ground slope
+        
+        height_map_end_event.record()
+        height_map_end_event.synchronize()
+        height_map_time = cuda.event_elapsed_time(height_map_start_event, height_map_end_event)
+        total_execution_time += height_map_time
+        
+        ###### Estimate ground slope ######
+        slope_start_event = cuda.event()
+        slope_end_event = cuda.event()
+        slope_start_event.record()
 
         self.roughness_map = cuda.device_array([self.xy_size,self.xy_size])
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](self.roughness_map,-1.0,self.xy_size,self.xy_size)
@@ -358,47 +385,76 @@ class Gvom:
 
         self.__calculate_slope[blockspergrid, self.threads_per_block_2D](
             self.height_map, self.xy_size, self.xy_resolution, self.x_slope_map, self.y_slope_map, self.roughness_map)
+        
+        slope_end_event.record()
+        slope_end_event.synchronize()
+        slope_time = cuda.event_elapsed_time(slope_start_event, slope_end_event)
+        total_execution_time += slope_time
 
-        # Guess what the height is in unobserved cells
+        ###### Guess the height in unobserved cells ######
+        guess_start_event = cuda.event()
+        guess_end_event = cuda.event()
+        guess_start_event.record()
+
         self.guessed_height_delta = cuda.device_array([self.xy_size,self.xy_size])
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](self.guessed_height_delta,0.0,self.xy_size,self.xy_size)
-        
         self.__guess_height[blockspergrid, self.threads_per_block_2D](
             self.height_map,self.inferred_height_map,self.xy_size,self.xy_resolution,self.x_slope_map,self.y_slope_map,self.guessed_height_delta)
+        
+        guess_end_event.record()
+        guess_end_event.synchronize()
+        guess_time = cuda.event_elapsed_time(guess_start_event, guess_end_event)
+        total_execution_time += guess_time
 
+        ###### Check for positive obstacles ######
+        # Any cell where the max height is more than "threshold" above the height map and less than "threshold + robot height" is marked as an obstacle. Obstacle type can be determined from cell metrics
+        positive_start_event = cuda.event()
+        positive_end_event = cuda.event()
+        positive_start_event.record()
 
-        # Check for positive obstacles. Any cell where the max height is more than "threshold" above the height map and less than "threshold + robot height" is marked as an obstacle
-        # Obstacle type can be determined from cell metrics
         positive_obstacle_map = cuda.device_array([self.xy_size,self.xy_size],dtype=np.int32)
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](positive_obstacle_map,0,self.xy_size,self.xy_size)
-
         self.__make_positive_obstacle_map[blockspergrid, self.threads_per_block_2D](
             self.combined_index_map, self.height_map, self.xy_size, self.z_size, self.z_resolution, self.positive_obstacle_threshold,self.combined_hit_count,self.combined_total_count, self.robot_height, self.combined_origin,self.x_slope_map,self.y_slope_map,self.slope_obstacle_threshold, positive_obstacle_map)
 
+        positive_end_event.record()
+        positive_end_event.synchronize()
+        positive_time = cuda.event_elapsed_time(positive_start_event, positive_end_event)
+        total_execution_time += positive_time
 
-        # Check for negative obstacles. 
+        ###### Check for negative obstacles ######
+        negative_start_event = cuda.event()
+        negative_end_event = cuda.event()
+        negative_start_event.record()
+
         negative_obstacle_map = cuda.device_array([self.xy_size,self.xy_size],dtype=np.int32)
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](negative_obstacle_map,0,self.xy_size,self.xy_size)
-
         self.__make_negative_obstacle_map[blockspergrid, self.threads_per_block_2D](self.guessed_height_delta,negative_obstacle_map,self.negative_obstacle_threshold,self.xy_size)
 
-        # make ground visability map
-        visability_map = cuda.device_array([self.xy_size,self.xy_size],dtype=np.int32)
+        negative_end_event.record()
+        negative_end_event.synchronize()
+        negative_time = cuda.event_elapsed_time(negative_start_event, negative_end_event)
+        total_execution_time += negative_time
 
-        self.__make_visability_map[blockspergrid, self.threads_per_block_2D](visability_map,self.height_map,self.xy_size)
+        ###### Make ground visibility map ######
+        visibility_start_event = cuda.event()
+        visibility_end_event = cuda.event()
+        visibility_start_event.record()
 
+        visibility_map = cuda.device_array([self.xy_size,self.xy_size],dtype=np.int32)
+        self.__make_visibility_map[blockspergrid, self.threads_per_block_2D](visibility_map,self.height_map,self.xy_size)
 
-        # format output data
+        visibility_end_event.record()
+        visibility_end_event.synchronize()
+        visibility_time = cuda.event_elapsed_time(visibility_start_event, visibility_end_event)
+        total_execution_time += visibility_time
 
-        combined_origin_world = self.combined_origin.copy_to_host()
-        combined_origin_world[0] = combined_origin_world[0] * self.xy_resolution
-        combined_origin_world[1] = combined_origin_world[1] * self.xy_resolution
-        combined_origin_world[2] = combined_origin_world[2] * self.z_resolution
-
-        #print("2d map rate = " + str(1.0 / (time.time() - map_start_time)))
-
-        # return all maps as cpu arrays
-        return (combined_origin_world, positive_obstacle_map.copy_to_host(),negative_obstacle_map.copy_to_host(),self.roughness_map.copy_to_host(),visability_map.copy_to_host() )
+        ###### Assemble return values #####
+        map_return_tuple = (combined_origin_world, positive_obstacle_map.copy_to_host(),negative_obstacle_map.copy_to_host(),
+                            self.roughness_map.copy_to_host(),visibility_map.copy_to_host())
+        times_return_tuple = (comb_lookup_time, comb_data_time, eigen_time, height_map_time,
+                              slope_time, guess_time, positive_time, negative_time, visibility_time, total_execution_time)
+        return map_return_tuple, times_return_tuple
 
     def make_debug_voxel_map(self):
         if(self.combined_cell_count_cpu is None):
@@ -458,7 +514,7 @@ class Gvom:
     
     @staticmethod
     @cuda.jit
-    def __make_visability_map(visability,height_map,xy_size):
+    def __make_visibility_map(visability,height_map,xy_size):
         x, y = cuda.grid(2)
         if(x >= xy_size or y >= xy_size):
             return
@@ -906,49 +962,38 @@ class Gvom:
 
     @staticmethod
     @cuda.jit
-    def __combine_metrics(combined_metrics, combined_hit_count,combined_total_count,combined_min_height, combined_index_map, combined_origin, old_metrics, old_hit_count,old_total_count,old_min_height, old_index_map, old_origin, voxel_count, metrics_list, xy_size, z_size, num_metrics):
+    def __combine_metrics(combined_metrics, combined_hit_count,combined_total_count,combined_min_height, combined_index_map,
+                          combined_origin, old_metrics, old_hit_count,old_total_count,old_min_height, old_index_map, old_origin, voxel_count, metrics_list, xy_size, z_size, num_metrics):
         x, y, z = cuda.grid(3)
-
         if(x >= xy_size or y >= xy_size or z >= z_size): # Check kernel bounds
             return
 
         # Calculate offset between old and new maps
-
         dx = combined_origin[0] - old_origin[0]
         dy = combined_origin[1] - old_origin[1]
         dz = combined_origin[2] - old_origin[2]
-
         if((x + dx) >= xy_size or (y + dy) >= xy_size or (z + dz) >= z_size or (x+dx) < 0 or (y+dy) < 0 or (z+dz) < 0):
             return
 
-        index = combined_index_map[int(
-            x + y * xy_size + z * xy_size * xy_size)]
-        index_old = old_index_map[int(
-            (x + dx) + (y + dy) * xy_size + (z + dz) * xy_size * xy_size)]
-
+        index = combined_index_map[int(x + y * xy_size + z * xy_size * xy_size)]
+        index_old = old_index_map[int((x + dx) + (y + dy) * xy_size + (z + dz) * xy_size * xy_size)]
         if(index < 0 or index_old < 0):
             return
-
-       
-
         
-        ## Combine covariance
-        
-        #self.metrics_count = 10 # Mean: x, y, z; Covariance: xx, xy, xz, yy, yz, zz; Count
-        #                               0  1  2               3   4   5   6   7   8
-
-        
-        # C = (n1 * C1 + n2 * C2 + 
-        #   n1 * (mean_x1 - mean_x_combined) * (mean_y1 - mean_y_combined) + 
-        #   n2 * (mean_x2 - mean_x_combined) * (mean_y2 - mean_y_combined)
-        #   ) / (n1 + n2)
-
+        ## Combine mean
         mean_x_combined = (combined_metrics[index,0] * combined_metrics[index,9] + old_metrics[index_old, 0] * old_metrics[index_old, 9]) / (combined_metrics[index,9] + old_metrics[index_old, 9])
 
         mean_y_combined = (combined_metrics[index,1] * combined_metrics[index,9] + old_metrics[index_old, 1] * old_metrics[index_old, 9]) / (combined_metrics[index,9] + old_metrics[index_old, 9])
 
         mean_z_combined = (combined_metrics[index,2] * combined_metrics[index,9] + old_metrics[index_old, 2] * old_metrics[index_old, 9]) / (combined_metrics[index,9] + old_metrics[index_old, 9])
+        #x
+        combined_metrics[index,0] = mean_x_combined
+        #y
+        combined_metrics[index,1] = mean_y_combined
+        #z
+        combined_metrics[index,2] = mean_z_combined
 
+        # Combine covariance
         # xx
         combined_metrics[index,3] =( combined_metrics[index,9] * combined_metrics[index,3] + old_metrics[index_old, 9] * old_metrics[index_old, 3] + 
             combined_metrics[index,9] * (combined_metrics[index,0] - mean_x_combined) * (combined_metrics[index,0] - mean_x_combined) + 
@@ -983,15 +1028,6 @@ class Gvom:
             combined_metrics[index,9] * (combined_metrics[index,2] - mean_z_combined) * (combined_metrics[index,2] - mean_z_combined) + 
             old_metrics[index_old, 9] *  (old_metrics[index_old,2] - mean_z_combined) *  (old_metrics[index_old,2] - mean_z_combined)
             ) / (combined_metrics[index,9] + old_metrics[index_old, 9]) 
-
-        ## Combine mean
-
-        #x
-        combined_metrics[index,0] = mean_x_combined
-        #y
-        combined_metrics[index,1] = mean_y_combined
-        #z
-        combined_metrics[index,2] = mean_z_combined
 
         ## Combine other metrics
         combined_metrics[index,9] = combined_metrics[index,9] + old_metrics[index_old, 9]
@@ -1028,30 +1064,26 @@ class Gvom:
 
     @staticmethod
     @cuda.jit
-    def __combine_indices(combined_cell_count, combined_index_map, combined_origin, old_index_map, voxel_count, old_origin, xy_size, z_size):
+    def __combine_indices(combined_cell_count, combined_index_map, combined_origin, old_index_map, voxel_count, old_origin, xy_size,
+                          z_size):
         x, y, z = cuda.grid(3)
-
         if(x >= xy_size or y >= xy_size or z >= z_size):
-            #print("bad index")
             return
 
         dx = combined_origin[0] - old_origin[0]
         dy = combined_origin[1] - old_origin[1]
         dz = combined_origin[2] - old_origin[2]
-
         if((x + dx) >= xy_size or (y + dy) >= xy_size or (z + dz) >= z_size or (x+dx) < 0 or (y+dy) < 0 or (z+dz) < 0):
-            # print("oob")
             return
 
         index = int(x + y * xy_size + z * xy_size * xy_size)
         index_old = int((x + dx) + (y + dy) * xy_size +
                         (z + dz) * xy_size * xy_size)
 
-        # If there is no data or empty data in the combined map and an occpuied voexl in the new map
+        # If there is no data or empty data in the combined map and an occupied voxel in the new map
         if(old_index_map[index_old] >= 0 and combined_index_map[index] <= -1):
             combined_index_map[index] = cuda.atomic.add(combined_cell_count, 0, 1)
-
-        # if there is an empty cell in the old map and no data or empty data in the new map
+        # If there is an empty cell in the old map and no data or empty data in the new map
         elif(old_index_map[index_old] < -1 and combined_index_map[index] <= -1):
             combined_index_map[index] += old_index_map[index_old] + 1
 
@@ -1090,9 +1122,6 @@ class Gvom:
         pass
 
     def __calculate_metrics_master(self, pointcloud, point_count, count, index_map, cell_count_cpu, origin):
-        # print("mean")
-        #self.metrics_count = 10 # Mean: x, y, z; Covariance: xx, xy, xz, yy, yz, zz; Count
-
         metric_blocks = self.blocks = math.ceil(self.xy_size*self.xy_size*self.z_size / self.threads_per_block)
 
         blockspergrid_cell = math.ceil(cell_count_cpu / self.threads_per_block_2D[0])
@@ -1102,42 +1131,24 @@ class Gvom:
         metrics = cuda.device_array([cell_count_cpu,self.metrics_count])
         self.__init_2D_array[blockspergrid, self.threads_per_block_2D](metrics,0.0,cell_count_cpu,self.metrics_count)
 
-
-        #print("min height")
         min_height = cuda.device_array([cell_count_cpu*3], dtype=np.float32)
         self.__init_1D_array[math.ceil(cell_count_cpu*3/self.threads_per_block),self.threads_per_block](min_height,1,cell_count_cpu*3)
 
-
-        #print("calc blocks")
-        calculate_blocks = ( int(np.ceil(point_count/self.threads_per_block)))
+        calculate_blocks = (int(np.ceil(point_count/self.threads_per_block)))
         
-        #print("calc mean")
-        
-        self.__calculate_mean[calculate_blocks, self.threads_per_block](
-            self.xy_resolution, self.z_resolution, self.xy_size, self.z_size, self.min_distance, index_map, pointcloud, metrics, point_count, origin, self.xy_eigen_dist, self.z_eigen_dist)
-        
-        #print("norm")
-        normalize_blocks = ( int(np.ceil(cell_count_cpu/self.threads_per_block_2D[0])), int(np.ceil(3/self.threads_per_block_2D[0])) )
-
+        self.__calculate_mean[calculate_blocks, self.threads_per_block](self.xy_resolution, self.z_resolution, self.xy_size,
+                                                                        self.z_size, self.min_distance, index_map, pointcloud, metrics, point_count, origin, self.xy_eigen_dist, self.z_eigen_dist)
+        normalize_blocks = (int(np.ceil(cell_count_cpu/self.threads_per_block_2D[0])), int(np.ceil(3/self.threads_per_block_2D[0])) )
         self.__normalize_mean[normalize_blocks,self.threads_per_block_2D](metrics,cell_count_cpu)
-        #print("other")
         
-        
-        self.__calculate_covariance[calculate_blocks,self.threads_per_block](
-
-            self.xy_resolution, self.z_resolution, self.xy_size, self.z_size, self.min_distance, index_map, pointcloud, count, metrics, point_count, origin, self.xy_eigen_dist, self.z_eigen_dist
-            
-                )
-        
-        normalize_blocks = ( int(np.ceil(cell_count_cpu/self.threads_per_block_2D[0])), int(np.ceil(6/self.threads_per_block_2D[0])) )
-
-
+        self.__calculate_covariance[calculate_blocks,self.threads_per_block](self.xy_resolution, self.z_resolution, self.xy_size,
+                                                                             self.z_size, self.min_distance, index_map, pointcloud, count, metrics, point_count, origin, self.xy_eigen_dist, self.z_eigen_dist)
+    
+        normalize_blocks = (int(np.ceil(cell_count_cpu/self.threads_per_block_2D[0])), int(np.ceil(6/self.threads_per_block_2D[0])))
         self.__normalize_covariance[normalize_blocks,self.threads_per_block_2D](metrics,cell_count_cpu)
 
         self.__calculate_min_height[calculate_blocks, self.threads_per_block](
             self.xy_resolution, self.z_resolution, self.xy_size, self.z_size, self.min_distance, index_map, pointcloud, min_height, point_count, origin)
-        
-        #print("return")
 
         return metrics, min_height
 
@@ -1220,9 +1231,7 @@ class Gvom:
             slope[2] = slope[2] / ray_length
 
             slope_max = max(abs(slope[0]), max(abs(slope[1]), abs(slope[2])))
-
             slope_index = 0
-
             if(slope_max == abs(slope[1])):
                 slope_index = 1
             if(slope_max == abs(slope[2])):
@@ -1232,10 +1241,8 @@ class Gvom:
             direction = slope[slope_index]/abs(slope[slope_index])
             while (length < ray_length - 1):
                 pt[slope_index] += direction
-                pt[(slope_index + 1) % 3] += slope[(slope_index + 1) %
-                                                   3] / abs(slope[slope_index])
-                pt[(slope_index + 2) % 3] += slope[(slope_index + 2) %
-                                                   3] / abs(slope[slope_index])
+                pt[(slope_index + 1) % 3] += slope[(slope_index + 1) % 3] / abs(slope[slope_index])
+                pt[(slope_index + 2) % 3] += slope[(slope_index + 2) % 3] / abs(slope[slope_index])
 
                 x_index = math.floor(pt[0] - origin[0])
                 if(x_index < 0 or x_index >= xy_size):
@@ -1292,32 +1299,24 @@ class Gvom:
             z_index_base = math.floor((points[i, 2]/z_resolution) - origin[2])
 
             for x_index in range(x_index_base - xy_eigen_dist,  x_index_base + 1 + xy_eigen_dist):
-
                 if(x_index < 0 or x_index >= xy_size):
                     continue
 
                 for y_index in range(y_index_base - xy_eigen_dist, y_index_base + 1 + xy_eigen_dist ):
-
                     if(y_index < 0 or y_index >= xy_size):
                         continue
 
                     for z_index in range(z_index_base - z_eigen_dist, z_index_base + 1 + z_eigen_dist):
-
                         if(z_index < 0 or z_index >= z_size):
                             continue
-
-                        
 
                         local_point[0] = (points[i, 0]/xy_resolution) - origin[0] - x_index
                         local_point[1] = (points[i, 1]/xy_resolution) - origin[1] - y_index
                         local_point[2] = (points[i, 2]/z_resolution) - origin[2] - z_index
 
-
                         index = index_map[int( x_index + y_index*xy_size + z_index*xy_size*xy_size )]
-
-                        if index <0 :
-                                continue
-
+                        if index < 0:
+                            continue
 
                         cuda.atomic.add(metrics, (index,0), local_point[0])
                         cuda.atomic.add(metrics, (index,1), local_point[1])
@@ -1344,7 +1343,6 @@ class Gvom:
 
             d2 = points[i, 0]*points[i, 0] + points[i, 1] * \
                 points[i, 1] + points[i, 2]*points[i, 2]
-
             if(d2 < min_distance*min_distance):
                 return
 
@@ -1355,31 +1353,24 @@ class Gvom:
             z_index_base = math.floor((points[i, 2]/z_resolution) - origin[2])
 
             for x_index in range(x_index_base - xy_eigen_dist,  x_index_base + 1 + xy_eigen_dist):
-
                 if(x_index < 0 or x_index >= xy_size):
                     continue
 
                 for y_index in range(y_index_base - xy_eigen_dist, y_index_base + 1 + xy_eigen_dist ):
-
                     if(y_index < 0 or y_index >= xy_size):
                         continue
 
                     for z_index in range(z_index_base - z_eigen_dist, z_index_base + 1 + z_eigen_dist):
-
                         if(z_index < 0 or z_index >= z_size):
                             continue
-
-                        
 
                         local_point[0] = (points[i, 0]/xy_resolution) - origin[0] - x_index
                         local_point[1] = (points[i, 1]/xy_resolution) - origin[1] - y_index
                         local_point[2] = (points[i, 2]/z_resolution) - origin[2] - z_index
 
-
                         index = index_map[int( x_index + y_index*xy_size + z_index*xy_size*xy_size )]
-
                         if index <0 :
-                                continue
+                            continue
 
                         # xx
                         cov_xx = (local_point[0] - metrics[index,0])*(local_point[0] - metrics[index,0])
@@ -1458,13 +1449,6 @@ class Gvom:
         if(i >= cell_count):
             return
 
-        # Mean: x, y, z; Covariance: xx, xy, xz, yy, yz, zz
-        #       0  1  2               3   4   5   6   7   8
-
-        # [xx   xy   xz]
-        # [xy   yy   yz]
-        # [xz   yz   zz]
-
         xx = metrics[i,3]
         xy = metrics[i,4]
         xz = metrics[i,5]
@@ -1478,20 +1462,12 @@ class Gvom:
         q = (xx + yy + zz ) / 3.0
         
         if (p1 == 0): # diagonal matrix
-
             voxels_eigenvalues[i,0] = max(xx,max(yy,zz))
-            
             voxels_eigenvalues[i,2] = min(xx,min(yy,zz))
-
             voxels_eigenvalues[i,1] = 3.0 * q - voxels_eigenvalues[i,0] - voxels_eigenvalues[i,2]
-
-
         else:
-
-            
             p2 = (xx - q)*(xx - q) + (yy - q)*(yy - q) + (zz - q)*(zz - q) + 2.0 * p1
             p = math.sqrt(p2 / 6.0)
-            
             B = numba.cuda.local.array(shape=6, dtype=numba.float64)
 
             B[0] = (xx - q)/p
